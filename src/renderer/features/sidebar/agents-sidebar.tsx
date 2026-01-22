@@ -2714,6 +2714,23 @@ export function AgentsSidebar({
                 {/* Help Button - isolated component to prevent sidebar re-renders */}
                 <HelpSection isMobile={isMobileFullscreen} />
 
+                {/* New Button */}
+                <Tooltip delayDuration={500}>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        // TODO: Add action for new button
+                        toast.success("Button clicked!")
+                      }}
+                      className="flex items-center justify-center h-7 w-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-[background-color,color,transform] duration-150 ease-out active:scale-[0.97] outline-offset-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring/70"
+                    >
+                      <PlusIcon className="h-4 w-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>New</TooltipContent>
+                </Tooltip>
+
                 {/* Archive Button - isolated component to prevent sidebar re-renders */}
                 <ArchiveSection archivedChatsCount={archivedChatsCount} />
               </div>
