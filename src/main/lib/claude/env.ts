@@ -27,6 +27,10 @@ let binaryPathComputed = false
  * Get path to the bundled Claude binary.
  * Returns the path to the native Claude executable bundled with the app.
  * CACHED - only computes path once and logs verbose info on first call.
+ * 
+ * @deprecated Use system CLI resolver instead: resolveClaudeCli() from ./system-cli-resolver
+ * This function is kept for backwards compatibility but should not be used for new code.
+ * The bundled binary approach is being phased out in favor of system-installed CLI.
  */
 export function getBundledClaudeBinaryPath(): string {
   // Return cached path if already computed
@@ -110,20 +114,122 @@ function parseEnvOutput(output: string): Record<string, string> {
 }
 
 /**
- * Load full shell environment using interactive login shell.
+ * Get platform-appropriate shell executable.
+ * Windows: COMSPEC (usually cmd.exe) or PowerShell
+ * macOS/Linux: SHELL env var or /bin/zsh
+ */
+function getShellExecutable(): string {
+  if (process.platform === "win32") {
+    // Windows: prefer COMSPEC (usually C:\Windows\System32\cmd.exe)
+    // Fallback to PowerShell if COMSPEC is not set
+    return process.env.COMSPEC || "powershell.exe"
+  }
+  // macOS/Linux: use SHELL env var or default to zsh
+  return process.env.SHELL || "/bin/zsh"
+}
+
+/**
+ * Build Windows PATH by combining process.env.PATH with common install locations.
+ * Windows packaged apps via NSIS may have reduced PATH; this fallback ensures
+ * common install locations are checked.
+ */
+function buildWindowsPath(): string {
+  const paths: string[] = []
+  const pathSeparator = ";"
+
+  // Start with existing PATH from process.env
+  if (process.env.PATH) {
+    paths.push(...process.env.PATH.split(pathSeparator).filter(Boolean))
+  }
+
+  // Add Windows-specific common paths for Claude installations
+  const commonPaths = [
+    // User-local installations
+    path.join(os.homedir(), ".local", "bin"),
+    // Program Files installations (both 32-bit and 64-bit)
+    path.join(process.env.ProgramFiles || "C:\\Program Files", "Claude"),
+    path.join(
+      process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
+      "Claude",
+    ),
+    // Local AppData installations (common for Electron apps)
+    path.join(
+      process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"),
+      "Programs",
+      "Claude",
+    ),
+    // System paths
+    path.join(process.env.SystemRoot || "C:\\Windows", "System32"),
+    path.join(process.env.SystemRoot || "C:\\Windows"),
+  ]
+
+  // Add common paths that aren't already in PATH
+  for (const commonPath of commonPaths) {
+    const normalizedPath = path.normalize(commonPath)
+    if (!paths.includes(normalizedPath)) {
+      paths.push(normalizedPath)
+    }
+  }
+
+  const finalPath = paths.join(pathSeparator)
+  console.log(
+    `[claude-env] Built Windows PATH with ${paths.length} entries (${finalPath.length} chars)`,
+  )
+  return finalPath
+}
+
+/**
+ * Load full shell environment using login shell (non-interactive).
  * This captures PATH, HOME, and all shell profile configurations.
  * Results are cached for the lifetime of the process.
+ *
+ * On Windows: Derives PATH directly from process.env + common locations
+ * (no shell invocation needed, avoids cmd.exe/PowerShell complexity).
+ *
+ * On macOS/Linux: Uses shell with -lc flags (login, command) instead of -ilc
+ * to avoid interactive prompts and TTY issues from dotfiles expecting a terminal.
  */
 export function getClaudeShellEnvironment(): Record<string, string> {
   if (cachedShellEnv !== null) {
     return { ...cachedShellEnv }
   }
 
-  const shell = process.env.SHELL || "/bin/zsh"
+  // Windows: derive PATH without shell invocation
+  if (process.platform === "win32") {
+    console.log("[claude-env] Windows detected, deriving PATH without shell invocation")
+    const env: Record<string, string> = {
+      ...process.env,
+      PATH: buildWindowsPath(),
+      HOME: os.homedir(),
+      USER: os.userInfo().username,
+      USERPROFILE: os.homedir(),
+    }
+
+    // Strip keys that could interfere with Claude's auth resolution
+    for (const key of STRIPPED_ENV_KEYS) {
+      if (key in env) {
+        console.log(`[claude-env] Stripped ${key} from shell environment`)
+        delete env[key]
+      }
+    }
+
+    console.log(
+      `[claude-env] Loaded ${Object.keys(env).length} environment variables (Windows)`,
+    )
+    cachedShellEnv = env
+    return { ...env }
+  }
+
+  // macOS/Linux: use shell to get full environment
+  const shell = getShellExecutable()
   const command = `echo -n "${DELIMITER}"; env; echo -n "${DELIMITER}"; exit`
 
   try {
-    const output = execSync(`${shell} -ilc '${command}'`, {
+    // Use -lc flags (not -ilc):
+    // -l: login shell (sources .zprofile/.profile for PATH setup)
+    // -c: execute command
+    // Avoids -i (interactive) to skip TTY prompts and reduce latency
+    const output = execSync(`${shell} -lc '${command}'`, {
       encoding: "utf8",
       timeout: 5000,
       env: {
@@ -156,22 +262,50 @@ export function getClaudeShellEnvironment(): Record<string, string> {
 
     // Fallback: return minimal required env
     const home = os.homedir()
-    const fallbackPath = [
-      `${home}/.local/bin`,
-      "/opt/homebrew/bin",
-      "/usr/local/bin",
-      "/usr/bin",
-      "/bin",
-      "/usr/sbin",
-      "/sbin",
-    ].join(":")
+    const pathSeparator = process.platform === "win32" ? ";" : ":"
+    const fallbackPathParts =
+      process.platform === "win32"
+        ? [
+            // Windows fallback paths
+            path.join(home, ".local", "bin"),
+            path.join(process.env.ProgramFiles || "C:\\Program Files", "Claude"),
+            path.join(
+              process.env.LOCALAPPDATA ||
+                path.join(home, "AppData", "Local"),
+              "Programs",
+              "Claude",
+            ),
+            path.join(
+              process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
+              "Claude",
+            ),
+            path.join(process.env.SystemRoot || "C:\\Windows", "System32"),
+          ]
+        : [
+            // Unix fallback paths
+            `${home}/.local/bin`,
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+          ]
+
+    const fallbackPath = fallbackPathParts.join(pathSeparator)
 
     const fallback: Record<string, string> = {
       HOME: home,
       USER: os.userInfo().username,
       PATH: fallbackPath,
-      SHELL: process.env.SHELL || "/bin/zsh",
-      TERM: "xterm-256color",
+      SHELL: getShellExecutable(),
+      TERM: process.platform === "win32" ? undefined : "xterm-256color",
+    }
+
+    // Add Windows-specific env vars
+    if (process.platform === "win32") {
+      fallback.USERPROFILE = home
+      fallback.SystemRoot = process.env.SystemRoot || "C:\\Windows"
     }
 
     console.log("[claude-env] Using fallback environment")
@@ -213,8 +347,14 @@ export function buildClaudeEnv(options?: {
   // 3. Ensure critical vars are present
   if (!env.HOME) env.HOME = os.homedir()
   if (!env.USER) env.USER = os.userInfo().username
-  if (!env.SHELL) env.SHELL = "/bin/zsh"
-  if (!env.TERM) env.TERM = "xterm-256color"
+  if (!env.SHELL) env.SHELL = getShellExecutable()
+  if (!env.TERM && process.platform !== "win32") env.TERM = "xterm-256color"
+  
+  // Windows-specific env vars
+  if (process.platform === "win32") {
+    if (!env.USERPROFILE) env.USERPROFILE = os.homedir()
+    if (!env.SystemRoot) env.SystemRoot = process.env.SystemRoot || "C:\\Windows"
+  }
 
   // 4. Add custom overrides
   if (options?.ghToken) {

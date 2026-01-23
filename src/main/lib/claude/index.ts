@@ -14,3 +14,15 @@ export {
 } from "./env"
 export { checkOfflineFallback } from "./offline-handler"
 export type { OfflineCheckResult, CustomClaudeConfig } from "./offline-handler"
+export {
+	resolveClaudeCli,
+	checkClaudeCliHealth,
+	clearResolutionCache,
+	getCachedCliPath,
+	getCachedCliVersion,
+} from "./system-cli-resolver"
+export type {
+	ClaudeCliResolution,
+	ClaudeVersionInfo,
+} from "./system-cli-resolver"
+export { ClaudeCliHealthStatus } from "./system-cli-resolver"

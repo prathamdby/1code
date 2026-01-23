@@ -77,17 +77,22 @@ Claude asks clarifying questions, builds structured plans, and shows clean markd
 
 ## Installation
 
+### Prerequisites
+
+- **Bun** - JavaScript runtime
+- **Python** - Required for Claude Code
+- **Xcode Command Line Tools** (macOS only)
+- **Claude CLI** - System `claude` binary must be installed and available in PATH
+
 ### Option 1: Build from source (free)
 
 ```bash
-# Prerequisites: Bun, Python, Xcode Command Line Tools (macOS)
 bun install
-bun run claude:download  # Download Claude binary (required!)
 bun run build
 bun run package:mac  # or package:win, package:linux
 ```
 
-> **Important:** The `claude:download` step downloads the Claude CLI binary which is required for the agent chat to work. If you skip this step, the app will build but agent functionality won't work.
+> **Important:** Ensure the `claude` CLI binary is installed system-wide and available in your PATH. The app will use the system `claude` binary instead of bundling its own.
 
 ### Option 2: Subscribe to 1code.dev (recommended)
 
@@ -99,9 +104,10 @@ Your subscription helps us maintain and improve 1Code.
 
 ```bash
 bun install
-bun run claude:download  # First time only
 bun run dev
 ```
+
+> **Note:** Make sure the `claude` CLI binary is installed system-wide and available in your PATH.
 
 ## Feedback & Community
 

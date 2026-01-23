@@ -1,6 +1,6 @@
 import * as Sentry from "@sentry/electron/main"
 import { app, BrowserWindow, Menu, session } from "electron"
-import { existsSync, readFileSync, readlinkSync, unlinkSync } from "fs"
+import { existsSync, readlinkSync, unlinkSync } from "fs"
 import { createServer } from "http"
 import { join } from "path"
 import { AuthManager } from "./auth-manager"
@@ -517,27 +517,10 @@ if (gotTheLock) {
     // This helps diagnose first-install issues where the protocol isn't recognized yet
     verifyProtocolRegistration()
 
-    // Get Claude Code version for About panel
-    let claudeCodeVersion = "unknown"
-    try {
-      const isDev = !app.isPackaged
-      const versionPath = isDev
-        ? join(app.getAppPath(), "resources/bin/VERSION")
-        : join(process.resourcesPath, "bin/VERSION")
-
-      if (existsSync(versionPath)) {
-        const versionContent = readFileSync(versionPath, "utf-8")
-        claudeCodeVersion = versionContent.split("\n")[0]?.trim() || "unknown"
-      }
-    } catch (error) {
-      console.warn("[App] Failed to read Claude Code version:", error)
-    }
-
-    // Set About panel options with Claude Code version
+    // Set About panel options
     app.setAboutPanelOptions({
       applicationName: "1Code",
       applicationVersion: app.getVersion(),
-      version: `Claude Code ${claudeCodeVersion}`,
       copyright: "Copyright © 2026 21st.dev",
     })
 

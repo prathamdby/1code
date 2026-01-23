@@ -13,8 +13,18 @@ import {
   getBundledClaudeBinaryPath,
   logClaudeEnv,
   logRawClaudeMessage,
+  resolveClaudeCli,
+  checkClaudeCliHealth,
+  clearResolutionCache,
+  ClaudeCliHealthStatus,
   type UIMessageChunk,
+  type ClaudeCliResolution,
 } from "../../claude"
+import {
+  resolveClaudeCli,
+  ClaudeCliHealthStatus,
+  type ClaudeCliResolution,
+} from "../../claude/system-cli-resolver"
 import { getProjectMcpServers, GLOBAL_MCP_PATH, readClaudeConfig, type McpServerConfig } from "../../claude-config"
 import { chats, claudeCodeCredentials, getDatabase, subChats } from "../../db"
 import { createRollbackStash } from "../../git/stash"
@@ -625,91 +635,108 @@ export const claudeRouter = router({
               logClaudeEnv(claudeEnv, `[${input.subChatId}] `)
             }
 
-            // Create isolated config directory per subChat to prevent session contamination
-            // The Claude binary stores sessions in ~/.claude/ based on cwd, which causes
-            // cross-chat contamination when multiple chats use the same project folder
-            // For Ollama: use chatId instead of subChatId so all messages in the same chat share history
-            const isolatedConfigDir = path.join(
-              app.getPath("userData"),
-              "claude-sessions",
-              isUsingOllama ? input.chatId : input.subChatId
-            )
+            // Detect chat mode: worktree-based vs local mode
+            // Worktree mode: cwd contains ".21st/worktrees/" → unique cwd per chat → no CLAUDE_CONFIG_DIR needed
+            // Local mode: cwd = project root (shared across chats) → needs CLAUDE_CONFIG_DIR isolation
+            const isWorktreeMode = input.cwd.includes(path.sep + ".21st" + path.sep + "worktrees" + path.sep) ||
+                                   input.cwd.includes("/.21st/worktrees/")
+            
+            console.log(`[claude] Chat mode: ${isWorktreeMode ? "worktree" : "local"}, cwd: ${input.cwd}`)
 
             // MCP servers to pass to SDK (read from ~/.claude.json)
             let mcpServersForSdk: Record<string, any> | undefined
+            let isolatedConfigDir: string | undefined
 
-            // Ensure isolated config dir exists and symlink skills/agents from ~/.claude/
-            // This is needed because SDK looks for skills at $CLAUDE_CONFIG_DIR/skills/
-            // OPTIMIZATION: Only create symlinks once per subChatId (cached)
-            try {
-              await fs.mkdir(isolatedConfigDir, { recursive: true })
+            // Conditional isolation: only create isolated config dir for local-mode chats
+            // Worktree-based chats have unique cwd, so they don't need CLAUDE_CONFIG_DIR isolation
+            if (!isWorktreeMode) {
+              console.log(`[claude] Local mode detected - creating isolated config dir for session separation`)
+              
+              // Create isolated config directory per subChat to prevent session contamination
+              // The Claude binary stores sessions in ~/.claude/ based on cwd, which causes
+              // cross-chat contamination when multiple chats use the same project folder
+              // For Ollama: use chatId instead of subChatId so all messages in the same chat share history
+              isolatedConfigDir = path.join(
+                app.getPath("userData"),
+                "claude-sessions",
+                isUsingOllama ? input.chatId : input.subChatId
+              )
 
-              // Only create symlinks if not already created for this config dir
-              const cacheKey = isUsingOllama ? input.chatId : input.subChatId
-              if (!symlinksCreated.has(cacheKey)) {
-                const homeClaudeDir = path.join(os.homedir(), ".claude")
-                const skillsSource = path.join(homeClaudeDir, "skills")
-                const skillsTarget = path.join(isolatedConfigDir, "skills")
-                const agentsSource = path.join(homeClaudeDir, "agents")
-                const agentsTarget = path.join(isolatedConfigDir, "agents")
-
-                // Symlink skills directory if source exists and target doesn't
-                try {
-                  const skillsSourceExists = await fs.stat(skillsSource).then(() => true).catch(() => false)
-                  const skillsTargetExists = await fs.lstat(skillsTarget).then(() => true).catch(() => false)
-                  if (skillsSourceExists && !skillsTargetExists) {
-                    await fs.symlink(skillsSource, skillsTarget, "dir")
-                  }
-                } catch (symlinkErr) {
-                  // Ignore symlink errors (might already exist or permission issues)
-                }
-
-                // Symlink agents directory if source exists and target doesn't
-                try {
-                  const agentsSourceExists = await fs.stat(agentsSource).then(() => true).catch(() => false)
-                  const agentsTargetExists = await fs.lstat(agentsTarget).then(() => true).catch(() => false)
-                  if (agentsSourceExists && !agentsTargetExists) {
-                    await fs.symlink(agentsSource, agentsTarget, "dir")
-                  }
-                } catch (symlinkErr) {
-                  // Ignore symlink errors (might already exist or permission issues)
-                }
-
-                symlinksCreated.add(cacheKey)
-              }
-
-              // Read MCP servers from ~/.claude.json for the original project path
-              // These will be passed directly to the SDK via options.mcpServers
-              // OPTIMIZATION: Cache MCP config by file mtime to avoid re-parsing on every message
-              const claudeJsonSource = path.join(os.homedir(), ".claude.json")
+              // Ensure isolated config dir exists and symlink skills/agents from ~/.claude/
+              // This is needed because SDK looks for skills at $CLAUDE_CONFIG_DIR/skills/
+              // OPTIMIZATION: Only create symlinks once per subChatId (cached)
               try {
-                const stats = await fs.stat(claudeJsonSource).catch(() => null)
+                await fs.mkdir(isolatedConfigDir, { recursive: true })
 
-                if (stats) {
-                  const currentMtime = stats.mtimeMs
-                  const cached = mcpConfigCache.get(claudeJsonSource)
-                  const lookupPath = input.projectPath || input.cwd
+                // Only create symlinks if not already created for this config dir
+                const cacheKey = isUsingOllama ? input.chatId : input.subChatId
+                if (!symlinksCreated.has(cacheKey)) {
+                  const homeClaudeDir = path.join(os.homedir(), ".claude")
+                  const skillsSource = path.join(homeClaudeDir, "skills")
+                  const skillsTarget = path.join(isolatedConfigDir, "skills")
+                  const agentsSource = path.join(homeClaudeDir, "agents")
+                  const agentsTarget = path.join(isolatedConfigDir, "agents")
 
-                  // Get or refresh cached config
-                  let claudeConfig: any
-                  if (cached && cached.mtime === currentMtime) {
-                    claudeConfig = cached.config
-                  } else {
-                    claudeConfig = JSON.parse(await fs.readFile(claudeJsonSource, "utf-8"))
-                    mcpConfigCache.set(claudeJsonSource, { config: claudeConfig, mtime: currentMtime })
+                  // Symlink skills directory if source exists and target doesn't
+                  try {
+                    const skillsSourceExists = await fs.stat(skillsSource).then(() => true).catch(() => false)
+                    const skillsTargetExists = await fs.lstat(skillsTarget).then(() => true).catch(() => false)
+                    if (skillsSourceExists && !skillsTargetExists) {
+                      await fs.symlink(skillsSource, skillsTarget, "dir")
+                    }
+                  } catch (symlinkErr) {
+                    // Ignore symlink errors (might already exist or permission issues)
                   }
 
-                  // Merge global + project servers (project overrides global)
-                  // getProjectMcpServers resolves worktree paths internally
-                  const globalServers = claudeConfig.mcpServers || {}
-                  const projectServers = getProjectMcpServers(claudeConfig, lookupPath) || {}
-                  mcpServersForSdk = { ...globalServers, ...projectServers }
+                  // Symlink agents directory if source exists and target doesn't
+                  try {
+                    const agentsSourceExists = await fs.stat(agentsSource).then(() => true).catch(() => false)
+                    const agentsTargetExists = await fs.lstat(agentsTarget).then(() => true).catch(() => false)
+                    if (agentsSourceExists && !agentsTargetExists) {
+                      await fs.symlink(agentsSource, agentsTarget, "dir")
+                    }
+                  } catch (symlinkErr) {
+                    // Ignore symlink errors (might already exist or permission issues)
+                  }
+
+                  symlinksCreated.add(cacheKey)
                 }
-              } catch (configErr) {
-                console.error(`[claude] Failed to read MCP config:`, configErr)
+              } catch (mkdirErr) {
+                console.error(`[claude] Failed to setup isolated config dir:`, mkdirErr)
               }
-            } catch (mkdirErr) {
-              console.error(`[claude] Failed to setup isolated config dir:`, mkdirErr)
+            } else {
+              console.log(`[claude] Worktree mode detected - using system Claude config (cwd provides isolation)`)
+            }
+
+            // Read MCP servers from ~/.claude.json for the original project path
+            // These will be passed directly to the SDK via options.mcpServers
+            // OPTIMIZATION: Cache MCP config by file mtime to avoid re-parsing on every message
+            const claudeJsonSource = path.join(os.homedir(), ".claude.json")
+            try {
+              const stats = await fs.stat(claudeJsonSource).catch(() => null)
+
+              if (stats) {
+                const currentMtime = stats.mtimeMs
+                const cached = mcpConfigCache.get(claudeJsonSource)
+                const lookupPath = input.projectPath || input.cwd
+
+                // Get or refresh cached config
+                let claudeConfig: any
+                if (cached && cached.mtime === currentMtime) {
+                  claudeConfig = cached.config
+                } else {
+                  claudeConfig = JSON.parse(await fs.readFile(claudeJsonSource, "utf-8"))
+                  mcpConfigCache.set(claudeJsonSource, { config: claudeConfig, mtime: currentMtime })
+                }
+
+                // Merge global + project servers (project overrides global)
+                // getProjectMcpServers resolves worktree paths internally
+                const globalServers = claudeConfig.mcpServers || {}
+                const projectServers = getProjectMcpServers(claudeConfig, lookupPath) || {}
+                mcpServersForSdk = { ...globalServers, ...projectServers }
+              }
+            } catch (configErr) {
+              console.error(`[claude] Failed to read MCP config:`, configErr)
             }
 
             // Build final env - only add OAuth token if we have one
@@ -718,12 +745,67 @@ export const claudeRouter = router({
               ...(claudeCodeToken && {
                 CLAUDE_CODE_OAUTH_TOKEN: claudeCodeToken,
               }),
-              // Re-enable CLAUDE_CONFIG_DIR now that we properly map MCP configs
-              CLAUDE_CONFIG_DIR: isolatedConfigDir,
+              // Only set CLAUDE_CONFIG_DIR for local-mode chats (worktree chats use system config)
+              ...(isolatedConfigDir && {
+                CLAUDE_CONFIG_DIR: isolatedConfigDir,
+              }),
             }
 
-            // Get bundled Claude binary path
-            const claudeBinaryPath = getBundledClaudeBinaryPath()
+            // Resolve Claude CLI from system (PATH or configured location)
+            let claudeBinaryPath: string
+            try {
+              const resolvedCli = await resolveClaudeCli()
+              
+              if (!resolvedCli.path || resolvedCli.status === ClaudeCliHealthStatus.MISSING) {
+                emitError(
+                  new Error(resolvedCli.error || "Claude CLI not found"),
+                  "Claude CLI not installed"
+                )
+                safeEmit({
+                  type: "error",
+                  errorText: "Claude CLI not found. Please install it using: npm install -g @anthropic-ai/claude-cli",
+                } as UIMessageChunk)
+                safeEmit({ type: "finish" } as UIMessageChunk)
+                safeComplete()
+                return
+              }
+
+              if (resolvedCli.status === ClaudeCliHealthStatus.VERSION_INCOMPATIBLE) {
+                emitError(
+                  new Error(resolvedCli.error || "Incompatible CLI version"),
+                  "Claude CLI version incompatible"
+                )
+                safeEmit({
+                  type: "error",
+                  errorText: `${resolvedCli.error}\n\nPlease upgrade: npm update -g @anthropic-ai/claude-cli`,
+                } as UIMessageChunk)
+                safeEmit({ type: "finish" } as UIMessageChunk)
+                safeComplete()
+                return
+              }
+
+              if (resolvedCli.status !== ClaudeCliHealthStatus.OK) {
+                emitError(
+                  new Error(resolvedCli.error || "CLI validation failed"),
+                  "Claude CLI validation error"
+                )
+                safeEmit({
+                  type: "error",
+                  errorText: resolvedCli.error || "Claude CLI validation failed",
+                } as UIMessageChunk)
+                safeEmit({ type: "finish" } as UIMessageChunk)
+                safeComplete()
+                return
+              }
+
+              claudeBinaryPath = resolvedCli.path
+              console.log(`[claude] Using system CLI: ${claudeBinaryPath} (${resolvedCli.version?.version})`)
+            } catch (resolveError) {
+              console.error("[claude] Failed to resolve system CLI, falling back to bundled binary:", resolveError)
+              // Fallback to bundled binary if system resolution fails
+              claudeBinaryPath = getBundledClaudeBinaryPath()
+              console.log(`[claude] Using bundled binary fallback: ${claudeBinaryPath}`)
+            }
 
             const resumeSessionId = input.sessionId || existingSessionId || undefined
 
@@ -1938,4 +2020,95 @@ ${prompt}
       console.log(`[refreshMcpServers] Reloaded ${mcpServers.length} servers for ${input.projectPath}`)
       return { mcpServers, projectPath: input.projectPath }
     }),
+
+  /**
+   * Check Claude CLI health status
+   * Returns health status, version, path, and error message if applicable
+   * Used by renderer for settings UI
+   */
+  checkCliHealth: publicProcedure
+    .input(
+      z.object({
+        configuredPath: z.string().nullable().optional(),
+        skipCache: z.boolean().optional(),
+      }).optional()
+    )
+    .query(async ({ input }) => {
+      try {
+        const resolution = await resolveClaudeCli({
+          configuredPath: input?.configuredPath,
+          skipCache: input?.skipCache,
+        })
+
+        return {
+          status: resolution.status,
+          version: resolution.version?.version,
+          path: resolution.path,
+          message: resolution.error,
+          isCompatible: resolution.version?.isCompatible,
+        }
+      } catch (error) {
+        console.error("[checkCliHealth] Error checking CLI health:", error)
+        return {
+          status: ClaudeCliHealthStatus.VALIDATION_ERROR,
+          version: undefined,
+          path: undefined,
+          message: error instanceof Error ? error.message : String(error),
+          isCompatible: false,
+        }
+      }
+    }),
+
+  /**
+   * Validate a CLI path
+   */
+  validateCliPath: publicProcedure
+    .input(z.string())
+    .mutation(async ({ input }) => {
+      const resolution = await resolveClaudeCli({
+        configuredPath: input,
+        skipCache: true,
+      })
+      return {
+        valid: resolution.status === ClaudeCliHealthStatus.OK,
+        status: resolution.status,
+        path: resolution.path,
+        version: resolution.version?.version ?? null,
+        error: resolution.error ?? null,
+      }
+    }),
+
+  /**
+   * Open file picker for CLI executable
+   */
+  openCliPathPicker: publicProcedure.mutation(async ({ ctx }) => {
+    const window = ctx.getWindow?.() ?? BrowserWindow.getFocusedWindow()
+
+    if (!window) {
+      console.error("[Claude CLI] No window available for file dialog")
+      return null
+    }
+
+    // Ensure window is focused before showing dialog
+    if (!window.isFocused()) {
+      window.focus()
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+
+    const result = await dialog.showOpenDialog(window, {
+      properties: ["openFile"],
+      title: "Select Claude CLI Executable",
+      buttonLabel: "Select",
+      filters: [
+        { name: "Executables", extensions: process.platform === "win32" ? ["exe", "cmd", "bat"] : [] },
+        { name: "All Files", extensions: ["*"] },
+      ],
+    })
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return null
+    }
+
+    return result.filePaths[0]!
+  }),
 })

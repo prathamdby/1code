@@ -64,7 +64,6 @@ node_modules
 out
 release
 release-*
-resources/bin
 *.log
 .DS_Store
 electron.vite.config.*.mjs

@@ -405,6 +405,16 @@ export const ctrlTabTargetAtom = atomWithStorage<CtrlTabTarget>(
   { getOnInit: true },
 )
 
+// Preferences - Claude CLI Path Override
+// Optional custom path to Claude CLI executable (absolute path)
+// If empty/null, uses system PATH resolution
+export const claudeCliPathAtom = atomWithStorage<string | null>(
+  "preferences:claude-cli-path",
+  null,
+  undefined,
+  { getOnInit: true },
+)
+
 // Preferences - VS Code Code Themes
 // Selected themes for code syntax highlighting (separate for light/dark UI themes)
 export const vscodeCodeThemeLightAtom = atomWithStorage<string>(
